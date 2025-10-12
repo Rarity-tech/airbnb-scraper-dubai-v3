@@ -1,79 +1,115 @@
-name: Scrape Airbnb Dubai V3 (Optimisé)
+name: Scrape Airbnb Dubai V3
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */6 * * *'  # Toutes les 6h
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 35
-    
-    strategy:
-      fail-fast: false
-      max-parallel: 1
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
-
-      - name: Cache Playwright browsers
-        uses: actions/cache@v4
-        id: playwright-cache
-        with:
-          path: ~/.cache/ms-playwright
-          key: playwright-${{ runner.os }}-1.40.0
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install playwright==1.40.0
 
-      - name: Install Playwright browsers
-        if: steps.playwright-cache.outputs.cache-hit != 'true'
-        run: python -m playwright install --with-deps chromium
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
 
-      - name: Install Playwright deps only
-        if: steps.playwright-cache.outputs.cache-hit == 'true'
-        run: python -m playwright install-deps chromium
-
-      - name: Run scraper V3
-        run: python scrape_airbnb_v3.py
+      - name: Run scraper
+        id: scraper
         continue-on-error: true
+        run: |
+          python scrape_airbnb_v3.py
+          echo "SCRAPER_EXIT_CODE=$?" >> $GITHUB_ENV
 
-      - name: Upload artifacts
+      - name: Check generated files
+        run: |
+          echo "=== Listing working directory ==="
+          ls -lah
+          echo ""
+          echo "=== Checking CSV files ==="
+          if [ -f "airbnb_listings_run.csv" ]; then
+            echo "✓ airbnb_listings_run.csv exists ($(wc -l < airbnb_listings_run.csv) lines)"
+          else
+            echo "✗ airbnb_listings_run.csv NOT FOUND"
+          fi
+          
+          if [ -f "airbnb_listings_master.csv" ]; then
+            echo "✓ airbnb_listings_master.csv exists ($(wc -l < airbnb_listings_master.csv) lines)"
+          else
+            echo "✗ airbnb_listings_master.csv NOT FOUND"
+          fi
+
+      - name: Upload CSV artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: airbnb-results-${{ github.run_number }}
+          name: airbnb-csvs-${{ github.run_number }}
           path: |
             airbnb_listings_run.csv
             airbnb_listings_master.csv
-            checkpoint.json
+          if-no-files-found: warn
           retention-days: 30
 
-      - name: Commit results
-        if: always()
-        run: |
-          git config --local user.name "github-actions[bot]"
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git add airbnb_listings_master.csv airbnb_listings_run.csv || true
-          git diff --cached --quiet || git commit -m "🤖 Update: $(date +'%Y-%m-%d %H:%M') - ${{ github.run_number }}"
-          git push || echo "Push failed, continuing..."
-
-      - name: Upload to artifact (backup)
+      - name: Upload checkpoint (debug)
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: failed-run-${{ github.run_number }}
+          name: checkpoint-debug-${{ github.run_number }}
           path: checkpoint.json
+          if-no-files-found: ignore
+
+      - name: Commit and push results
+        if: success() || steps.scraper.outcome == 'success'
+        run: |
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # Add files if they exist
+          [ -f "airbnb_listings_master.csv" ] && git add airbnb_listings_master.csv
+          [ -f "airbnb_listings_run.csv" ] && git add airbnb_listings_run.csv
+          
+          # Commit only if there are changes
+          if ! git diff --cached --quiet; then
+            git commit -m "🤖 Scrape results: $(date +'%Y-%m-%d %H:%M UTC') [run #${{ github.run_number }}]"
+            git push || echo "⚠️ Push failed (network issue?)"
+          else
+            echo "ℹ️ No changes to commit"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 📊 Scraping Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f "airbnb_listings_run.csv" ]; then
+            LINES=$(wc -l < airbnb_listings_run.csv)
+            echo "- ✅ Run CSV: **$((LINES - 1))** listings scraped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ❌ Run CSV: **Not generated**" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -f "airbnb_listings_master.csv" ]; then
+            TOTAL=$(wc -l < airbnb_listings_master.csv)
+            echo "- ✅ Master CSV: **$((TOTAL - 1))** total listings" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ⚠️ Master CSV: **Not found**" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Exit code: \`${{ env.SCRAPER_EXIT_CODE }}\`" >> $GITHUB_STEP_SUMMARY
