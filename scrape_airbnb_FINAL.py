@@ -16,7 +16,6 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
-# Regex pour licence Dubai (format: ABC-DEF-123456)
 RE_LICENSE = re.compile(r"\b([A-Z]{3}-[A-Z]{3}-[A-Z0-9]{4,6})\b", re.I)
 
 class ScraperState:
@@ -32,7 +31,6 @@ class ScraperState:
         return self.elapsed_min() >= TIME_LIMIT_MIN or len(self.scraped) >= MAX_NEW_LISTINGS
 
 def load_master_urls():
-    """Charge les URLs déjà dans le master CSV"""
     urls = set()
     if os.path.exists(OUTPUT_MASTER):
         try:
@@ -41,11 +39,10 @@ def load_master_urls():
                     u = row.get("url_annonce", "").strip()
                     if u: urls.add(u)
         except Exception as e:
-            print(f"⚠️  Erreur chargement master: {e}")
+            print(f"⚠️  Erreur master: {e}")
     return urls
 
 def create_browser(pw):
-    """Lance Chromium avec options anti-détection"""
     return pw.chromium.launch(
         headless=True,
         args=[
@@ -57,31 +54,25 @@ def create_browser(pw):
     )
 
 def create_context(browser):
-    """Context avec anti-détection renforcé"""
     ctx = browser.new_context(
         user_agent=random.choice(USER_AGENTS),
         locale="fr-FR",
         viewport={'width': 1920, 'height': 1080},
         extra_http_headers={
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'fr-FR,fr;q=0.9,en;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'fr-FR,fr;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
             'DNT': '1',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
         }
     )
     
-    # Anti-détection JavaScript
     ctx.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
-        Object.defineProperty(navigator, 'languages', {get: () => ['fr-FR', 'fr', 'en']});
         window.chrome = {runtime: {}};
-        delete navigator.__proto__.webdriver;
     """)
     
-    # Bloquer seulement images/media lourdes
     ctx.route("**/*", lambda r: (
         r.abort() if r.request.resource_type in ["image", "media"] 
         else r.continue_()
@@ -90,19 +81,13 @@ def create_context(browser):
     return ctx
 
 def build_url(base, offset):
-    """Construit URL de pagination"""
-    # Airbnb utilise cursor-based pagination
     return f"{base}?items_offset={offset}&section_offset=0"
 
 def extract_license(page):
-    """Extraction RAPIDE de la licence Dubai"""
-    # Sélecteurs prioritaires basés sur le vrai HTML
     selectors = [
         'div[data-testid="listing-permit-license-number"] span',
         'div:has-text("Permit")',
-        'div:has-text("License")',
         'div:has-text("DTCM")',
-        'span:has-text("Registration")',
     ]
     
     for sel in selectors:
@@ -118,7 +103,6 @@ def extract_license(page):
     return ""
 
 def scrape_listing(url, context, state):
-    """Scrape UNE annonce (optimisé)"""
     listing = {
         "url_annonce": url,
         "titre_annonce": "",
@@ -132,55 +116,33 @@ def scrape_listing(url, context, state):
         page = context.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=40000)
         
-        # Accept cookies
         try:
             btn = page.wait_for_selector(
-                "button:has-text('Accept'), button:has-text('OK'), button:has-text('Accepter')", 
+                "button:has-text('Accept'), button:has-text('Accepter')", 
                 timeout=3000
             )
             if btn: btn.click()
         except: pass
         
-        # Attendre chargement
         time.sleep(1)
         
-        # Titre (plusieurs tentatives)
         try:
-            # Méthode 1: h1 standard
             h1 = page.wait_for_selector("h1", timeout=5000)
             if h1: listing["titre_annonce"] = h1.inner_text().strip()
-        except:
-            try:
-                # Méthode 2: data-testid
-                title = page.query_selector("[data-testid='listing-title']")
-                if title: listing["titre_annonce"] = title.inner_text().strip()
-            except: pass
-        
-        # Licence
-        listing["code_licence"] = extract_license(page)
-        
-        # Hôte (lien profil)
-        try:
-            # Chercher lien vers profil hôte
-            host_selectors = [
-                "a[href*='/users/show/']",
-                "a[href*='/user/show/']",
-                "a[aria-label*='Profil']",
-            ]
-            
-            for sel in host_selectors:
-                host = page.query_selector(sel)
-                if host:
-                    listing["nom_hote"] = host.inner_text().strip()
-                    href = host.get_attribute("href") or ""
-                    if href:
-                        if href.startswith("/"): 
-                            href = "https://www.airbnb.com" + href
-                        listing["url_profil_hote"] = href
-                        break
         except: pass
         
-        print(f"✓ {listing['titre_annonce'][:60] or 'Sans titre'} | {listing['code_licence'] or 'Pas de licence'}")
+        listing["code_licence"] = extract_license(page)
+        
+        try:
+            host = page.query_selector("a[href*='/users/show/']")
+            if host:
+                listing["nom_hote"] = host.inner_text().strip()
+                href = host.get_attribute("href") or ""
+                if href.startswith("/"): href = "https://www.airbnb.com" + href
+                listing["url_profil_hote"] = href
+        except: pass
+        
+        print(f"✓ {listing['titre_annonce'][:60] or 'Sans titre'} | {listing['code_licence'] or 'N/A'}")
         
     except Exception as e:
         print(f"✗ {url}: {e}")
@@ -190,70 +152,62 @@ def scrape_listing(url, context, state):
     return listing
 
 def collect_urls(context, base_url, state):
-    """Collecte les URLs de listings (MÉTHODE MULTIPLE)"""
     urls = []
     page = context.new_page()
     
     for page_num in range(MAX_PAGES):
         if state.should_stop(): break
         
-        offset = page_num * 18  # Airbnb utilise 18 items par page
+        offset = page_num * 18
         url = build_url(base_url, offset)
         
         print(f"\n🔍 Page {page_num} (offset={offset})")
         
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=35000)
-            
-            # Attendre chargement
             time.sleep(2)
             
-            # === MÉTHODE 1: Liens directs ===
-            links_method1 = set()
+            # Méthode 1: Liens directs
+            links1 = set()
             try:
                 page.wait_for_selector('a[href*="/rooms/"]', timeout=10000)
                 for a in page.query_selector_all('a[href*="/rooms/"]'):
                     href = a.get_attribute("href")
                     if href and '/rooms/' in href:
-                        clean_url = href.split("?")[0]
-                        if clean_url.startswith("/"): 
-                            clean_url = "https://www.airbnb.fr" + clean_url
-                        links_method1.add(clean_url)
-                print(f"  Méthode 1 (liens): {len(links_method1)} URLs")
+                        clean = href.split("?")[0]
+                        if clean.startswith("/"): 
+                            clean = "https://www.airbnb.fr" + clean
+                        links1.add(clean)
+                print(f"  Méthode 1: {len(links1)} URLs")
             except:
                 print("  Méthode 1 échouée")
             
-            # === MÉTHODE 2: Meta tags itemprop ===
-            links_method2 = set()
+            # Méthode 2: Meta tags
+            links2 = set()
             try:
-                metas = page.query_selector_all('meta[itemprop="url"]')
-                for meta in metas:
+                for meta in page.query_selector_all('meta[itemprop="url"]'):
                     content = meta.get_attribute("content")
                     if content and '/rooms/' in content:
                         if not content.startswith("http"):
                             content = "https://www.airbnb.fr/rooms/" + content.split("/rooms/")[-1]
-                        links_method2.add(content.split("?")[0])
-                print(f"  Méthode 2 (meta): {len(links_method2)} URLs")
+                        links2.add(content.split("?")[0])
+                print(f"  Méthode 2: {len(links2)} URLs")
             except:
                 print("  Méthode 2 échouée")
             
-            # === MÉTHODE 3: Regex dans HTML brut ===
-            links_method3 = set()
+            # Méthode 3: Regex HTML
+            links3 = set()
             try:
                 html = page.content()
-                # Chercher pattern: /rooms/CHIFFRES
-                matches = re.findall(r'/rooms/(\d{10,20})', html)
-                for room_id in matches:
-                    links_method3.add(f"https://www.airbnb.fr/rooms/{room_id}")
-                print(f"  Méthode 3 (regex): {len(links_method3)} URLs")
+                for room_id in re.findall(r'/rooms/(\d{10,20})', html):
+                    links3.add(f"https://www.airbnb.fr/rooms/{room_id}")
+                print(f"  Méthode 3: {len(links3)} URLs")
             except:
                 print("  Méthode 3 échouée")
             
-            # === FUSION DES MÉTHODES ===
-            all_links = links_method1 | links_method2 | links_method3
-            print(f"  📊 TOTAL unique: {len(all_links)} URLs")
+            all_links = links1 | links2 | links3
+            print(f"  📊 Total: {len(all_links)} URLs")
             
-            # Ajouter les nouvelles URLs
             found = 0
             for clean_url in all_links:
                 if clean_url not in state.seen_urls:
@@ -264,35 +218,30 @@ def collect_urls(context, base_url, state):
                     if len(urls) >= MAX_NEW_LISTINGS:
                         break
             
-            print(f"  ✅ +{found} nouvelles (total collecté: {len(urls)})")
+            print(f"  ✅ +{found} nouvelles (collecté: {len(urls)})")
             
-            # Si aucune nouvelle URL, on arrête
             if found == 0:
-                print("  ⚠️  Aucune nouvelle URL, fin de la collecte")
+                print("  ⚠️  Aucune nouvelle URL, arrêt")
                 break
             
-            # Pause aléatoire
             time.sleep(random.uniform(1.5, 2.5))
             
         except Exception as e:
-            print(f"  ❌ Erreur page {page_num}: {e}")
+            print(f"  ❌ Erreur: {e}")
             continue
     
     page.close()
     return urls
 
 def save_csvs(listings):
-    """Sauvegarde CSV run et master"""
     header = ["url_annonce", "titre_annonce", "code_licence", "nom_hote", "url_profil_hote"]
     
-    # CSV du run (toujours créé)
     with open(OUTPUT_RUN, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=header)
         writer.writeheader()
         writer.writerows(listings)
     print(f"✓ {OUTPUT_RUN}: {len(listings)} listings")
     
-    # Master (fusion)
     master = {}
     
     if os.path.exists(OUTPUT_MASTER):
@@ -309,53 +258,51 @@ def save_csvs(listings):
         writer = csv.DictWriter(f, fieldnames=header)
         writer.writeheader()
         writer.writerows(master.values())
-    print(f"✓ {OUTPUT_MASTER}: {len(master)} total listings")
+    print(f"✓ {OUTPUT_MASTER}: {len(master)} total")
 
 def main():
     state = ScraperState()
     
     master_urls = load_master_urls()
     state.seen_urls.update(master_urls)
-    print(f"📚 Master contient {len(master_urls)} URLs\n")
+    print(f"📚 Master: {len(master_urls)} URLs\n")
     
     try:
         with sync_playwright() as pw:
             browser = create_browser(pw)
             context = create_context(browser)
             
-            print("=== PHASE 1: Collecte des URLs ===")
+            print("=== PHASE 1: Collecte URLs ===")
             new_urls = collect_urls(context, SEARCH_URL_BASE, state)
-            print(f"\n✓ Trouvé {len(new_urls)} nouvelles URLs\n")
+            print(f"\n✓ {len(new_urls)} URLs trouvées\n")
             
             if len(new_urls) == 0:
-                print("⚠️  AUCUNE URL trouvée ! Vérifier la connexion ou les sélecteurs.")
+                print("⚠️  AUCUNE URL trouvée !")
             
-            print("=== PHASE 2: Scraping des listings ===")
+            print("=== PHASE 2: Scraping ===")
             for i, url in enumerate(new_urls, 1):
                 if state.should_stop():
-                    print(f"\n⏱️  Limite temps/quota atteinte")
+                    print(f"\n⏱️  Limite atteinte")
                     break
                 
                 listing = scrape_listing(url, context, state)
                 state.scraped.append(listing)
                 
-                print(f"[{i}/{len(new_urls)}] {state.elapsed_min():.1f}min écoulées")
-                
-                # Pause entre chaque scrape
+                print(f"[{i}/{len(new_urls)}] {state.elapsed_min():.1f}min")
                 time.sleep(random.uniform(0.8, 1.5))
             
             context.close()
             browser.close()
             
     except Exception as e:
-        print(f"❌ Erreur fatale: {e}")
+        print(f"❌ Erreur: {e}")
         import traceback
         traceback.print_exc()
     
     print(f"\n=== SAUVEGARDE ===")
     save_csvs(state.scraped)
     
-    print(f"\n✅ Terminé en {state.elapsed_min():.1f}min | {len(state.scraped)} listings scrapés")
+    print(f"\n✅ Terminé: {state.elapsed_min():.1f}min | {len(state.scraped)} listings")
     return 0
 
 if __name__ == "__main__":
