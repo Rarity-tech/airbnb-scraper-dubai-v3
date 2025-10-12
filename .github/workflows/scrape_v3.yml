@@ -1,15 +1,15 @@
-name: Scrape Airbnb Dubai V3
+name: Scrape Airbnb Dubai FINAL
 
 on:
   workflow_dispatch:
 
 jobs:
   scrape:
-    runs-on: ubuntu-22.04     # ✅ Version compatible
+    runs-on: ubuntu-22.04
     timeout-minutes: 35
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -24,31 +24,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install Playwright Chromium
+      - name: Install Playwright
         run: |
           python -m playwright install chromium
           python -m playwright install-deps chromium
 
       - name: Run scraper
         continue-on-error: true
-        run: python scrape_airbnb_v3.py
+        run: python scrape_airbnb_FINAL.py
 
-      - name: Check generated files
+      - name: Check results
         run: |
-          echo "=== Files in directory ==="
-          ls -lah
+          echo "=== Fichiers générés ==="
+          ls -lah *.csv 2>/dev/null || echo "Aucun CSV trouvé"
           
           if [ -f "airbnb_listings_run.csv" ]; then
-            echo "✓ Run CSV exists ($(wc -l < airbnb_listings_run.csv) lines)"
-          else
-            echo "✗ Run CSV not found"
+            LINES=$(wc -l < airbnb_listings_run.csv)
+            echo "✓ Run CSV: $((LINES - 1)) listings"
           fi
 
-      - name: Upload CSV artifacts
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: airbnb-csvs-${{ github.run_number }}
+          name: airbnb-results-${{ github.run_number }}
           path: |
             airbnb_listings_run.csv
             airbnb_listings_master.csv
@@ -63,7 +62,7 @@ jobs:
           git add *.csv 2>/dev/null || true
           
           if ! git diff --cached --quiet 2>/dev/null; then
-            git commit -m "🤖 Scrape: $(date +'%Y-%m-%d %H:%M')"
+            git commit -m "🤖 Scrape $(date +'%Y-%m-%d %H:%M UTC')"
             git push || echo "Push failed"
           else
             echo "No changes"
