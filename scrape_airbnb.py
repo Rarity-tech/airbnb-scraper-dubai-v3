@@ -1,207 +1,354 @@
-from playwright.sync_api import sync_playwright
-import csv, re, time, random, urllib.parse, os
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+import csv, re, time, random, urllib.parse, os, json
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
+from typing import Set, List, Dict
+import hashlib
 
 # ========= CONFIG =========
 SEARCH_URL_BASE = "https://www.airbnb.fr/s/Marina-Walk--Dubai/homes?refinement_paths%5B%5D=%2Fhomes&acp_id=10bf84a9-12d7-4468-983f-e0ab703f2501&date_picker_type=calendar&source=structured_search_input_header&search_type=autocomplete_click&flexible_trip_lengths%5B%5D=one_week&price_filter_input_type=2&price_filter_num_nights=5&channel=EXPLORE&monthly_start_date=2025-11-01&monthly_length=3&monthly_end_date=2026-02-01&place_id=ChIJX47nvlBrXz4RVW5QiQ0Xvjw&location_bb=QcixMUJcmTxByKuqQlyWeQ%3D%3D"
+
 MAX_NEW_LISTINGS_PER_RUN = 100
-TIME_LIMIT_MIN = 30
-ITEMS_PER_PAGE = 20
-MAX_OFFSET = 4000
-SECTION_OFFSETS = [0,1,2,3,4,5]
+TIME_LIMIT_MIN = 28  # Marge de sécurité pour GitHub Actions
+MAX_WORKERS = 3  # Parallélisation
+CHECKPOINT_EVERY = 20  # Sauvegarder tous les 20 listings
+
 OUTPUT_RUN = "airbnb_listings_run.csv"
 OUTPUT_MASTER = "airbnb_listings_master.csv"
+CHECKPOINT_FILE = "checkpoint.json"
+
+# User-Agents rotatifs
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+]
+
+# Regex optimisées
+RE_LICENSE = re.compile(r"\b([A-Z]{3}-[A-Z]{3}-[A-Z0-9]{4,6})\b", re.I)
+RE_RATING = re.compile(r"([0-5]\.\d{1,2})", re.I)
 # =========================
 
-RE_LICENSE_PRIMARY = re.compile(r"\b([A-Z]{3}-[A-Z]{3}-[A-Z0-9]{4,6})\b", re.IGNORECASE)
-RE_LICENSE_FALLBACK = re.compile(r"(?:Registration(?:\s*No\.|\s*Number)?|Permit|License|Licence|DTCM)[^\n\r]*?([A-Z0-9][A-Z0-9\-\/]{3,40})", re.IGNORECASE)
-RE_HOST_RATING = re.compile(r"([0-5]\.\d{1,2})\s*(?:out of 5|·|/5|rating|reviews)", re.IGNORECASE)
+@dataclass
+class Listing:
+    url_annonce: str
+    titre_annonce: str = ""
+    code_licence: str = ""
+    nom_hote: str = ""
+    url_profil_hote: str = ""
+    note_globale_hote: str = ""
+    nb_annonces_hote: str = ""
+    date_inscription_hote: str = ""
 
-def now(): return time.monotonic()
-def minutes_elapsed(s, e): return (e - s) / 60.0
-def pause(a=0.7, b=1.1): time.sleep(random.uniform(a, b))
-def clean(s): return (s or "").replace("\xa0"," ").strip()
+class ScraperState:
+    def __init__(self):
+        self.start_time = time.monotonic()
+        self.seen_urls: Set[str] = set()
+        self.scraped_data: List[Listing] = []
+        self.processed_count = 0
+        
+    def elapsed_min(self) -> float:
+        return (time.monotonic() - self.start_time) / 60.0
+    
+    def should_stop(self) -> bool:
+        return (self.elapsed_min() >= TIME_LIMIT_MIN or 
+                len(self.scraped_data) >= MAX_NEW_LISTINGS_PER_RUN)
+    
+    def save_checkpoint(self):
+        """Sauvegarde intermédiaire pour ne pas perdre de données"""
+        with open(CHECKPOINT_FILE, 'w') as f:
+            json.dump({
+                'seen_urls': list(self.seen_urls),
+                'scraped_data': [asdict(l) for l in self.scraped_data],
+                'processed_count': self.processed_count
+            }, f)
+    
+    def load_checkpoint(self):
+        """Reprendre après interruption"""
+        if os.path.exists(CHECKPOINT_FILE):
+            try:
+                with open(CHECKPOINT_FILE, 'r') as f:
+                    data = json.load(f)
+                self.seen_urls = set(data['seen_urls'])
+                self.scraped_data = [Listing(**l) for l in data['scraped_data']]
+                self.processed_count = data['processed_count']
+                print(f"[checkpoint] Reprise: {len(self.scraped_data)} listings déjà scrapés")
+            except: pass
+
+def load_master_urls(path: str) -> Set[str]:
+    """Charge les URLs du master CSV"""
+    urls = set()
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.DictReader(f):
+                url = (row.get("url_annonce") or "").strip()
+                if url: urls.add(url)
+    return urls
+
+def create_stealth_context(playwright):
+    """Context avec anti-détection"""
+    browser = playwright.chromium.launch(
+        headless=True,
+        args=[
+            '--disable-blink-features=AutomationControlled',
+            '--disable-dev-shm-usage',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+        ]
+    )
+    
+    context = browser.new_context(
+        user_agent=random.choice(USER_AGENTS),
+        locale="en-US",
+        timezone_id="America/New_York",
+        viewport={'width': 1920, 'height': 1080},
+        extra_http_headers={
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+    )
+    
+    # Anti-détection JavaScript
+    context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        window.chrome = {runtime: {}};
+    """)
+    
+    # Bloquer ressources inutiles
+    context.route("**/*", lambda route: (
+        route.abort() if route.request.resource_type in ["image", "media", "font", "stylesheet"]
+        else route.continue_()
+    ))
+    
+    return browser, context
+
+def smart_wait(page, selector: str, timeout: int = 15000):
+    """Wait intelligent avec retry"""
+    try:
+        page.wait_for_selector(selector, timeout=timeout, state="visible")
+        return True
+    except:
+        return False
+
+def extract_license_fast(page) -> str:
+    """Extraction licence optimisée"""
+    # Sélecteurs prioritaires
+    selectors = [
+        "div[data-testid='listing-permit-license-number'] span:last-child",
+        "div:has-text('Permit number')",
+        "div:has-text('DTCM')",
+    ]
+    
+    for sel in selectors:
+        try:
+            el = page.query_selector(sel)
+            if el:
+                text = el.inner_text().strip()
+                match = RE_LICENSE.search(text)
+                if match: return match.group(1).upper()
+        except: continue
+    
+    return ""
+
+def scrape_single_listing(url: str, context, state: ScraperState) -> Listing:
+    """Scrape une annonce (optimisé)"""
+    listing = Listing(url_annonce=url)
+    
+    try:
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        
+        # Accept cookies si nécessaire
+        try:
+            btn = page.wait_for_selector(
+                "button:has-text('Accept'), button:has-text('OK')", 
+                timeout=3000
+            )
+            if btn: btn.click()
+        except: pass
+        
+        # Titre
+        if smart_wait(page, "h1", timeout=5000):
+            listing.titre_annonce = page.locator("h1").first.inner_text().strip()
+        
+        # Licence
+        listing.code_licence = extract_license_fast(page)
+        
+        # Info hôte
+        try:
+            host_link = page.query_selector("a[href*='/users/show/']")
+            if host_link:
+                listing.nom_hote = host_link.inner_text().strip()
+                listing.url_profil_hote = host_link.get_attribute("href") or ""
+                if listing.url_profil_hote.startswith("/"):
+                    listing.url_profil_hote = "https://www.airbnb.com" + listing.url_profil_hote
+        except: pass
+        
+        page.close()
+        print(f"✓ {listing.titre_annonce[:50]} | {listing.code_licence}")
+        
+    except Exception as e:
+        print(f"✗ Erreur {url}: {e}")
+    
+    return listing
+
+def collect_listing_urls(context, base_url: str, state: ScraperState) -> List[str]:
+    """Collecte URLs des listings (optimisé)"""
+    urls = []
+    page = context.new_page()
+    
+    for offset in range(0, 500, 20):  # Limiter la profondeur
+        if state.should_stop(): break
+        
+        search_url = build_page_url(base_url, offset, 0)
+        
+        try:
+            page.goto(search_url, wait_until="domcontentloaded", timeout=30000)
+            
+            if smart_wait(page, "a[href*='/rooms/']", timeout=10000):
+                links = page.query_selector_all("a[href*='/rooms/']")
+                
+                for link in links:
+                    href = link.get_attribute("href")
+                    if href:
+                        clean_url = href.split("?")[0]
+                        if clean_url.startswith("/"): 
+                            clean_url = "https://www.airbnb.com" + clean_url
+                        
+                        if clean_url not in state.seen_urls:
+                            urls.append(clean_url)
+                            state.seen_urls.add(clean_url)
+                            
+                            if len(urls) >= MAX_NEW_LISTINGS_PER_RUN:
+                                break
+                
+                print(f"[collect] offset={offset} → +{len(links)} URLs | total={len(urls)}")
+                time.sleep(random.uniform(0.5, 1.0))
+            else:
+                break  # Plus de résultats
+                
+        except Exception as e:
+            print(f"[collect] Erreur offset {offset}: {e}")
+            continue
+    
+    page.close()
+    return urls
 
 def build_page_url(base, items_offset, section_offset):
     p = urllib.parse.urlparse(base)
     q = dict(urllib.parse.parse_qsl(p.query, keep_blank_values=True))
-    q["items_offset"] = str(items_offset); q["section_offset"] = str(section_offset)
+    q["items_offset"] = str(items_offset)
+    q["section_offset"] = str(section_offset)
     return urllib.parse.urlunparse(p._replace(query=urllib.parse.urlencode(q)))
 
-def load_seen_urls(path):
-    seen = set()
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+def save_csvs(state: ScraperState):
+    """Sauvegarde les CSV"""
+    header = list(Listing.__annotations__.keys())
+    
+    # CSV du run
+    with open(OUTPUT_RUN, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=header)
+        writer.writeheader()
+        for listing in state.scraped_data:
+            writer.writerow(asdict(listing))
+    print(f"[save] {OUTPUT_RUN}: {len(state.scraped_data)} lignes")
+    
+    # CSV master (fusion sans doublons)
+    master_data = {}
+    
+    # Charger l'ancien master
+    if os.path.exists(OUTPUT_MASTER):
+        with open(OUTPUT_MASTER, "r", encoding="utf-8-sig", newline="") as f:
             for row in csv.DictReader(f):
-                u = (row.get("url_annonce") or "").strip()
-                if u: seen.add(u)
-    return seen
+                url = row.get("url_annonce", "").strip()
+                if url: master_data[url] = row
+    
+    # Ajouter nouvelles données
+    for listing in state.scraped_data:
+        url = listing.url_annonce.strip()
+        if url: master_data[url] = asdict(listing)
+    
+    # Écrire master
+    with open(OUTPUT_MASTER, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=header)
+        writer.writeheader()
+        for row in master_data.values():
+            writer.writerow(row)
+    print(f"[save] {OUTPUT_MASTER}: {len(master_data)} lignes totales")
 
-def extract_license(page):
-    try:
-        c = page.query_selector("div[data-testid='listing-permit-license-number']")
-        if c:
-            spans = c.query_selector_all("span")
-            if spans and len(spans) >= 2:
-                val = clean(spans[-1].inner_text())
-                m = RE_LICENSE_PRIMARY.search(val) or RE_LICENSE_FALLBACK.search(val)
-                return (m.group(1) if m else val).upper()
-    except: pass
-    for sel in ["div:has-text('Permit number')","div:has-text('Dubai Tourism permit number')",
-                "div:has-text('Registration')","div:has-text('License')","div:has-text('Licence')",
-                "div:has-text('DTCM')","section[aria-labelledby*='About this space']","div[data-section-id='DESCRIPTION_DEFAULT']"]:
+def main():
+    state = ScraperState()
+    state.load_checkpoint()
+    
+    # Charger URLs déjà dans master
+    master_urls = load_master_urls(OUTPUT_MASTER)
+    state.seen_urls.update(master_urls)
+    print(f"[init] URLs en master: {len(master_urls)}")
+    
+    with sync_playwright() as pw:
+        browser, context = create_stealth_context(pw)
+        
         try:
-            el = page.query_selector(sel)
-            if el:
-                txt = clean(el.inner_text())
-                m = RE_LICENSE_PRIMARY.search(txt) or RE_LICENSE_FALLBACK.search(txt)
-                if m: return m.group(1).upper()
-        except: pass
-    try:
-        body = clean(page.inner_text("body"))
-        m = RE_LICENSE_PRIMARY.search(body) or RE_LICENSE_FALLBACK.search(body)
-        if m: return m.group(1).upper()
-    except: pass
-    return ""
-
-def scrape_host_profile(context, host_url, start_time):
-    note, nb_listings, joined = "", "", ""
-    p = context.new_page(); p.goto(host_url, timeout=90000); pause()
-    for _ in range(10):
-        if minutes_elapsed(start_time, now()) >= TIME_LIMIT_MIN: break
-        p.evaluate("window.scrollBy(0, document.body.scrollHeight)"); pause(0.25,0.45)
-    try:
-        body = p.inner_text("body"); m = RE_HOST_RATING.search(body)
-        if m: note = m.group(1)
-    except: pass
-    try:
-        cards = p.query_selector_all("a[href*='/rooms/']")
-        nb_listings = str(len({(c.get_attribute('href') or '').split('?')[0] for c in cards}))
-    except: pass
-    try:
-        j = p.query_selector("span:has-text('Joined')") or p.query_selector("div:has-text('Joined')")
-        if j: joined = clean(j.inner_text())
-    except: pass
-    p.close(); return note, nb_listings, joined
-
-def collect_urls_from_page(page, exclude_set):
-    out, seen_local = [], set()
-    try:
-        page.wait_for_selector("a[href*='/rooms/']", timeout=30000)
-        for a in page.query_selector_all("a[href*='/rooms/']"):
-            href = (a.get_attribute("href") or "").strip()
-            if not href: continue
-            if href.startswith("/"): href = "https://www.airbnb.com"+href
-            href = href.split("?")[0]
-            if "/rooms/" in href and href not in exclude_set and href not in seen_local:
-                seen_local.add(href); out.append(href)
-    except: pass
-    return out
+            # Phase 1: Collecter les URLs
+            print("\n=== PHASE 1: Collecte des URLs ===")
+            new_urls = collect_listing_urls(context, SEARCH_URL_BASE, state)
+            print(f"[collect] {len(new_urls)} nouvelles URLs à scraper\n")
+            
+            # Phase 2: Scraper en parallèle (avec limite)
+            print("=== PHASE 2: Scraping des annonces ===")
+            
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = []
+                
+                for url in new_urls[:MAX_NEW_LISTINGS_PER_RUN]:
+                    if state.should_stop(): break
+                    
+                    # Créer un nouveau context pour chaque worker
+                    _, worker_ctx = create_stealth_context(pw)
+                    future = executor.submit(scrape_single_listing, url, worker_ctx, state)
+                    futures.append((future, worker_ctx))
+                
+                for i, (future, ctx) in enumerate(futures, 1):
+                    if state.should_stop(): 
+                        print("[stop] Limite temps/quota atteinte")
+                        break
+                    
+                    try:
+                        listing = future.result(timeout=60)
+                        state.scraped_data.append(listing)
+                        state.processed_count += 1
+                        
+                        # Checkpoint régulier
+                        if state.processed_count % CHECKPOINT_EVERY == 0:
+                            state.save_checkpoint()
+                            print(f"[checkpoint] Sauvegarde intermédiaire: {state.processed_count}")
+                        
+                    except Exception as e:
+                        print(f"[worker] Erreur: {e}")
+                    finally:
+                        ctx.close()
+                    
+                    print(f"[progress] {i}/{len(futures)} | temps: {state.elapsed_min():.1f}min")
+            
+        finally:
+            context.close()
+            browser.close()
+    
+    # Sauvegarde finale
+    save_csvs(state)
+    
+    # Nettoyer checkpoint
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
+    
+    print(f"\n[✓] Terminé en {state.elapsed_min():.1f}min | {len(state.scraped_data)} listings scrapés")
 
 if __name__ == "__main__":
-    if "airbnb." not in SEARCH_URL_BASE: raise SystemExit("Mets ton URL dans SEARCH_URL_BASE.")
-    start_time = now()
-
-    seen_global = load_seen_urls(OUTPUT_MASTER)
-    print(f"[init] URLs déjà en master: {len(seen_global)}")
-
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115 Safari/537.36",
-            locale="en-US",
-        )
-        context.route("**/*", lambda r: r.abort() if r.request.resource_type in ["image","media","font"] else r.continue_())
-        page = context.new_page()
-
-        new_urls = []
-        items_offset = 0
-        while (items_offset <= MAX_OFFSET 
-               and len(new_urls) < MAX_NEW_LISTINGS_PER_RUN 
-               and minutes_elapsed(start_time, now()) < TIME_LIMIT_MIN):
-            found_here = False
-            for so in [0,1,2,3,4,5]:
-                if minutes_elapsed(start_time, now()) >= TIME_LIMIT_MIN: break
-                url = build_page_url(SEARCH_URL_BASE, items_offset, so)
-                print(f"[search] offset={items_offset} section={so}")
-                try:
-                    page.goto(url, timeout=120000); pause()
-                    urls = collect_urls_from_page(page, exclude_set=seen_global)
-                    if urls:
-                        for u in urls:
-                            if len(new_urls) >= MAX_NEW_LISTINGS_PER_RUN: break
-                            if u not in seen_global:
-                                new_urls.append(u); seen_global.add(u)
-                        print(f"  +{len(urls)} candidates → nouvelles cumulées={len(new_urls)}")
-                        found_here = True; break
-                except Exception as e:
-                    print("  (skip)", e)
-            items_offset += 20
-            if not found_here: print("  rien de nouveau, on avance…")
-
-        print(f"[collect] nouvelles URLs à visiter: {len(new_urls)}")
-        rows = []
-
-        for i, url in enumerate(new_urls, 1):
-            if minutes_elapsed(start_time, now()) >= TIME_LIMIT_MIN:
-                print("[stop] limite de temps atteinte"); break
-            try:
-                page.goto(url, timeout=120000); pause()
-                try:
-                    btn = page.query_selector("button:has-text('Accept')") or page.query_selector("button:has-text('OK')")
-                    if btn: btn.click()
-                except: pass
-                titre = ""
-                try:
-                    h1 = page.query_selector("h1"); titre = clean(h1.inner_text() if h1 else "")
-                except: pass
-                code = extract_license(page)
-                nom_hote, host_url = "", ""
-                try:
-                    hl = page.query_selector("a[href*='/users/show/']")
-                    if hl:
-                        host_url = hl.get_attribute("href") or ""
-                        if host_url.startswith("/"): host_url = "https://www.airbnb.com"+host_url
-                        nom_hote = clean(hl.inner_text() or "")
-                except: pass
-                note, nb, joined = "", "", ""
-                if host_url and minutes_elapsed(start_time, now()) < TIME_LIMIT_MIN:
-                    note, nb, joined = scrape_host_profile(context, host_url, start_time)
-                rows.append({
-                    "url_annonce": url,
-                    "titre_annonce": titre,
-                    "code_licence": code,
-                    "nom_hote": nom_hote,
-                    "url_profil_hote": host_url,
-                    "note_globale_hote": note,
-                    "nb_annonces_hote": nb,
-                    "date_inscription_hote": joined,
-                })
-                print(f"[{i}/{len(new_urls)}] {titre} | licence:{code} | note:{note}")
-            except Exception as e:
-                print(f"[{i}] ERREUR {url}: {e}")
-
-        # --- ÉCRIRE TOUJOURS LE CSV DU RUN (même vide, avec en-tête) ---
-        header = ["url_annonce","titre_annonce","code_licence","nom_hote","url_profil_hote","note_globale_hote","nb_annonces_hote","date_inscription_hote"]
-        with open(OUTPUT_RUN, "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=header); w.writeheader()
-            for r in rows: w.writerow(r)
-        print("[ok] CSV run écrit (peut être vide):", OUTPUT_RUN)
-
-        # MASTER sans doublons
-        master_rows = []
-        if os.path.exists(OUTPUT_MASTER):
-            with open(OUTPUT_MASTER, "r", encoding="utf-8-sig", newline="") as f:
-                master_rows.extend(list(csv.DictReader(f)))
-        existing = { (r.get("url_annonce") or "").strip() for r in master_rows }
-        for r in rows:
-            u = (r.get("url_annonce") or "").strip()
-            if u and u not in existing:
-                master_rows.append(r); existing.add(u)
-        if master_rows:
-            with open(OUTPUT_MASTER, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.DictWriter(f, fieldnames=header); w.writeheader()
-                for r in master_rows: w.writerow(r)
-            print("[ok] CSV master mis à jour:", OUTPUT_MASTER)
-
-        context.close(); browser.close()
-        print(f"[fin] durée: {minutes_elapsed(start_time, now()):.1f} min")
+    main()
